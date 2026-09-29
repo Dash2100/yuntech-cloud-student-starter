@@ -1,0 +1,11 @@
+{
+  "description": "多了契約沒有的欄位 severity；寬鬆接收之後每週都要付代價",
+  "expect": {"status": 400, "error": "unknown_field", "field": "severity"},
+  "event": {
+    "event_id": "g08-m1-0003",
+    "device_id": "g08-d02",
+    "observed_at": "2026-09-29T10:05:00+08:00",
+    "type": "anomaly",
+    "severity": "high"
+  }
+}

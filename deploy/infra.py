@@ -6,6 +6,7 @@
   start    start the kept (stopped) host, report old/new public IP and /health (W4 T1)
   status   read-only: host state, public IP, SG rules, current egress /32
   deploy   install a committed version on the SAME host over SSH, then place app.env (W4 T3)
+  sources  add exact /32 SG sources after the egress address changed (prints old/new first)
 
 AWS calls go through scripts/lab.py run_aws (learnerlab profile, cleaned env).
 Every change prints its exact scope and waits for a typed "yes".
@@ -407,6 +408,35 @@ def cmd_status(args):
     print(f"egress now {egress_ip()}/32, SG source {res['source_cidr']}")
 
 
+def cmd_sources(args):
+    """Add exact /32 sources (e.g. a NAT pool whose egress rotates); prints old/new and waits for yes."""
+    res = current()
+    cfg = load_config(argparse.Namespace(group=res["group"], owner=res["owner"], source_cidr=res["source_cidr"],
+                                         week=None, az=None))
+    for cidr in args.add:
+        load_config(argparse.Namespace(group=cfg["group"], owner=cfg["owner"], source_cidr=cidr, week=None, az=None))
+    lab.verify()
+    check_ownership(res, cfg)
+    sg_id = res["security_group"]["id"]
+    perms = aws("ec2", "describe-security-groups", "--group-ids", sg_id)["SecurityGroups"][0]["IpPermissions"]
+    old = sorted({r["CidrIp"] for p in perms for r in p.get("IpRanges", [])})
+    new = [c for c in args.add if c not in old]
+    if not new:
+        print(f"沒有需要新增的來源；目前 {old}")
+        return
+    confirm([f"== SG {sg_id} 來源變更（只新增精確 /32，TCP 22、80） ==", f"舊：{old}", f"新：{sorted(old + new)}",
+             "理由：" + args.reason])
+    rules = [{"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
+              "IpRanges": [{"CidrIp": cidr, "Description": f"{desc} (added: {args.reason[:60]})"} for cidr in new]}
+             for port, desc in ((22, "ssh from one /32"), (80, "http from one /32"))]
+    aws("ec2", "authorize-security-group-ingress", "--group-id", sg_id, "--ip-permissions", json.dumps(rules))
+    res.setdefault("source_changes", []).append({"at": utc(), "old": old, "added": new, "reason": args.reason})
+    save_json(RESOURCES, res)
+    perms = aws("ec2", "describe-security-groups", "--group-ids", sg_id)["SecurityGroups"][0]["IpPermissions"]
+    for perm in perms:
+        print(f"讀回 tcp/{perm.get('FromPort')}: {sorted(r['CidrIp'] for r in perm.get('IpRanges', []))} ipv6={perm.get('Ipv6Ranges')}")
+
+
 def cmd_deploy(args):
     sha = resolve_commit("HEAD")
     dirty = subprocess.run(["git", "status", "--porcelain", "--", "app/service.py", "deploy/nginx.conf"],
@@ -467,10 +497,14 @@ def main():
     sub.add_parser("start")
     sub.add_parser("status")
     sub.add_parser("deploy")
+    sources = sub.add_parser("sources")
+    sources.add_argument("--add", nargs="+", required=True, metavar="IP/32")
+    sources.add_argument("--reason", required=True)
     args = parser.parse_args()
     try:
         REGION = lab.context()["region"]
-        {"up": cmd_up, "down": cmd_down, "start": cmd_start, "status": cmd_status, "deploy": cmd_deploy}[args.command](args)
+        {"up": cmd_up, "down": cmd_down, "start": cmd_start, "status": cmd_status, "deploy": cmd_deploy,
+         "sources": cmd_sources}[args.command](args)
     except (Stop, lab.LabError) as exc:
         print("STOP: " + str(exc), file=sys.stderr)
         return 1

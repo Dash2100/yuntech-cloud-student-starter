@@ -1,0 +1,11 @@
+{
+  "description": "g08/m1 合成事件：四個必填欄位加 note，全部符合契約",
+  "expect": {"status": 201},
+  "event": {
+    "event_id": "g08-m1-0001",
+    "device_id": "g08-d01",
+    "observed_at": "2026-09-29T10:00:00+08:00",
+    "type": "anomaly",
+    "note": "合成測資：泵浦震動偏高"
+  }
+}
