@@ -76,7 +76,7 @@ def run(base, reporter, operator, group, owner, seq, out=print):
         (2, "同上，不帶權杖", 401, ("POST", "/events", None, event)),
         (3, "operator 權杖送事件", 403, ("POST", "/events", operator, event)),
         (4, "reporter，observed_at 沒有時區", 400, ("POST", "/events", reporter, no_tz)),
-        (5, "reporter，再送一次 #1", 409, ("POST", "/events", reporter, event)),
+        (5, "reporter，同 ID、note 不同", 409, ("POST", "/events", reporter, dict(event, note="改過的內容"))),
         (6, "reporter 權杖讀清單", 403, ("GET", "/events", reporter, None)),
         (7, "operator 權杖讀清單", 200, ("GET", "/events", operator, None)),
     ]

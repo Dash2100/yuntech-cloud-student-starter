@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Individual deployment helper behind up.sh / down.sh / deploy.sh.
+"""Individual deployment helper behind up.sh / down.sh / deploy.sh / db-up.sh.
 
   up       create 1 SG + 1 imported key pair + 1 t3.micro from a commit (W3 scope)
   down     terminate by the IDs in .local/resources.json and read back; --stop only stops
   start    start the kept (stopped) host, report old/new public IP and /health (W4 T1)
   status   read-only: host state, public IP, SG rules, current egress /32
-  deploy   install a committed version on the SAME host over SSH, then place app.env (W4 T3)
+  deploy   install a committed version on the SAME host over SSH, then place app.env (+ W5 db.env)
   sources  add exact /32 SG sources after the egress address changed (prints old/new first)
+  db-up    W5: 2 private subnets + local-only route table + DB subnet group + SG-db + private RDS
+  db-status  read back the RDS and its network (read-only)
 
 AWS calls go through scripts/lab.py run_aws (learnerlab profile, cleaned env).
 Every change prints its exact scope and waits for a typed "yes".
@@ -19,8 +21,10 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -35,6 +39,7 @@ RESOURCES = LOCAL / "resources.json"
 CONFIG = LOCAL / "config.json"
 KNOWN_HOSTS = LOCAL / "known_hosts"
 APP_ENV = LOCAL / "app.env"
+DB_ENV = LOCAL / "db.env"
 INSTANCE_TYPE = "t3.micro"
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 LABEL_RE = re.compile(r"[a-z0-9]{1,16}")
@@ -437,6 +442,168 @@ def cmd_sources(args):
         print(f"讀回 tcp/{perm.get('FromPort')}: {sorted(r['CidrIp'] for r in perm.get('IpRanges', []))} ipv6={perm.get('Ipv6Ranges')}")
 
 
+def free_cidrs(vpc_cidr, taken, count):
+    """First `count` /24 blocks inside the VPC that overlap no existing subnet."""
+    taken = [ipaddress.ip_network(c) for c in taken]
+    found = []
+    for net in ipaddress.ip_network(vpc_cidr).subnets(new_prefix=24):
+        if not any(net.overlaps(t) for t in taken):
+            found.append(str(net))
+            if len(found) == count:
+                return found
+    raise Stop(f"{vpc_cidr} 裡找不到 {count} 段不重疊的 /24。")
+
+
+def db_readback(db_id):
+    db = aws("rds", "describe-db-instances", "--db-instance-identifier", db_id)["DBInstances"][0]
+    return {"status": db["DBInstanceStatus"], "PubliclyAccessible": db["PubliclyAccessible"],
+            "engine": f"{db['Engine']} {db['EngineVersion']}", "class": db["DBInstanceClass"],
+            "storage": f"{db['AllocatedStorage']} GiB {db['StorageType']}", "encrypted": db["StorageEncrypted"],
+            "multi_az": db["MultiAZ"], "az": db.get("AvailabilityZone"), "db_name": db.get("DBName"),
+            "endpoint": (db.get("Endpoint") or {}).get("Address"),
+            "subnet_group": db["DBSubnetGroup"]["DBSubnetGroupName"],
+            "security_groups": [g["VpcSecurityGroupId"] for g in db["VpcSecurityGroups"]]}
+
+
+def cmd_db_up(args):
+    """W5 T2: 2 private subnets + local-only route table + DB subnet group + SG-db + private RDS PostgreSQL."""
+    res = current()
+    cfg = load_config(argparse.Namespace(group=res["group"], owner=res["owner"], source_cidr=res["source_cidr"],
+                                         week=None, az=None))
+    ctx = lab.verify()
+    inst = check_ownership(res, cfg)
+    if not inst or inst["State"]["Name"] == "terminated":
+        raise Stop("主機不存在；先用 up.sh 建立，SG-db 的來源要是主機現在用的 SG。")
+    if res.get("db", {}).get("rds"):
+        raise Stop(f"已經有 RDS {res['db']['rds']['id']}；不要重跑 db-up.sh（會建出第二台）。")
+    vpc_id = inst["VpcId"]
+    host_sgs = [g["GroupId"] for g in inst["SecurityGroups"]]
+    if host_sgs != [res["security_group"]["id"]]:
+        raise Stop(f"主機的 SG {host_sgs} 與 resources.json 不符；停止。")
+    host_sg = host_sgs[0]
+    vpc_cidr = aws("ec2", "describe-vpcs", "--vpc-ids", vpc_id)["Vpcs"][0]["CidrBlock"]
+    existing = aws("ec2", "describe-subnets", "--filters", f"Name=vpc-id,Values={vpc_id}")["Subnets"]
+    cidrs = free_cidrs(vpc_cidr, [s["CidrBlock"] for s in existing], 2)
+    host_az = inst["Placement"]["AvailabilityZone"]
+    zones = [z["ZoneName"] for z in aws("ec2", "describe-availability-zones", "--filters",
+                                        "Name=state,Values=available", "Name=zone-type,Values=availability-zone")
+             ["AvailabilityZones"]]
+    azs = [host_az] + [z for z in zones if z != host_az][:1]
+    if len(azs) < 2:
+        raise Stop("找不到第二個 AZ。")
+    name = f"inspection-{cfg['group']}-{cfg['owner']}"
+    db_id = f"{name}-db"
+    db_user = "inspection_app"
+    confirm([
+        "== db-up.sh 將建立（W5 T2，私有資料庫） ==",
+        f"帳號末四碼 {ctx['account'][-4:]}，region {REGION}，VPC {vpc_id}（{vpc_cidr}）",
+        f"1. 私有子網 ×2：{cidrs[0]}（{azs[0]}）、{cidrs[1]}（{azs[1]}）；不與既有 {len(existing)} 個子網重疊",
+        f"   新路由表 {name}-private：只有 local 路由，明確關聯上面兩個子網",
+        f"2. DB 子網群組 {name}-dbsubnets；SG {name}-db：入站只有 TCP 5432，來源 = 主機 SG {host_sg}",
+        f"3. RDS {db_id}：PostgreSQL、db.t3.micro、20 GiB gp3、不公開、儲存加密、單一 AZ（{azs[0]}）、資料庫 inspection",
+        "4. 密碼由本腳本產生、寫進 .local/db.env（600）；經 600 暫存檔交給 AWS CLI，不出現在命令列、不顯示",
+        "5. 每項 ID 寫進 .local/resources.json；結束讀回 available 與 PubliclyAccessible=false",
+        f"標籤：course={lab.COURSE} week=w05 group={cfg['group']} owner={cfg['owner']}",
+        "費用：db.t3.micro 與 20 GiB gp3 依當期官方計價；停止最多 7 天會被 AWS 自動啟動",
+    ])
+    tcfg = dict(cfg, week="w05")
+    db = res.setdefault("db", {})
+
+    def record(key, rid, **extra):
+        db[key] = dict({"id": rid, "created_at": utc()}, **extra)
+        save_json(RESOURCES, res)
+
+    subnet_ids = []
+    for i, (cidr, az) in enumerate(zip(cidrs, azs), 1):
+        sid = aws("ec2", "create-subnet", "--vpc-id", vpc_id, "--cidr-block", cidr, "--availability-zone", az,
+                  "--tag-specifications", tag_spec(["subnet"], tcfg, f"{name}-private-{i}"))["Subnet"]["SubnetId"]
+        record(f"subnet_{i}", sid, cidr=cidr, az=az)
+        subnet_ids.append(sid)
+    rtb = aws("ec2", "create-route-table", "--vpc-id", vpc_id,
+              "--tag-specifications", tag_spec(["route-table"], tcfg, f"{name}-private"))["RouteTable"]["RouteTableId"]
+    record("route_table", rtb)
+    db["route_table"]["associations"] = [
+        aws("ec2", "associate-route-table", "--route-table-id", rtb, "--subnet-id", sid)["AssociationId"]
+        for sid in subnet_ids]
+    save_json(RESOURCES, res)
+    group_name = f"{name}-dbsubnets"
+    aws("rds", "create-db-subnet-group", "--db-subnet-group-name", group_name,
+        "--db-subnet-group-description", f"W5 private subnets {cfg['group']}-{cfg['owner']}",
+        "--subnet-ids", *subnet_ids, "--tags", json.dumps(tags(tcfg, group_name)))
+    record("subnet_group", group_name)
+    sg_db = aws("ec2", "create-security-group", "--group-name", f"{name}-db", "--vpc-id", vpc_id,
+                "--description", f"W5 RDS {cfg['group']}-{cfg['owner']}: 5432 from host SG only",
+                "--tag-specifications", tag_spec(["security-group"], tcfg, f"{name}-db"))["GroupId"]
+    record("security_group", sg_db, source_sg=host_sg)
+    aws("ec2", "authorize-security-group-ingress", "--group-id", sg_db, "--ip-permissions", json.dumps([{
+        "IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+        "UserIdGroupPairs": [{"GroupId": host_sg, "Description": "postgres from inspection host SG"}]}]))
+
+    password = secrets.token_urlsafe(24)  # URL-safe: no / @ " or space, which RDS rejects
+    lab.atomic_write(DB_ENV, f"DB_HOST=\nDB_PORT=5432\nDB_NAME=inspection\nDB_USER={db_user}\nDB_PASSWORD={password}\n")
+    request = {"DBInstanceIdentifier": db_id, "Engine": "postgres", "DBInstanceClass": "db.t3.micro",
+               "AllocatedStorage": 20, "StorageType": "gp3", "StorageEncrypted": True, "PubliclyAccessible": False,
+               "MultiAZ": False, "AvailabilityZone": azs[0], "DBName": "inspection", "MasterUsername": db_user,
+               "MasterUserPassword": password, "DBSubnetGroupName": group_name, "VpcSecurityGroupIds": [sg_db],
+               "BackupRetentionPeriod": 1, "DeletionProtection": False, "AutoMinorVersionUpgrade": True,
+               "Tags": tags(tcfg, db_id)}
+    fd, tmp = tempfile.mkstemp(prefix=".rds-", suffix=".json", dir=LOCAL)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            os.chmod(tmp, 0o600)
+            json.dump(request, stream)
+        aws("rds", "create-db-instance", "--cli-input-json", f"file://{tmp}")
+    finally:
+        os.unlink(tmp)
+    t0 = time.monotonic()
+    record("rds", db_id)
+    print(f"建立 {subnet_ids[0]}、{subnet_ids[1]}、{rtb}、{group_name}、{sg_db}、{db_id}；等待 available（約 7 分鐘）…")
+    status = None
+    while time.monotonic() - t0 < 1800:
+        status = db_readback(db_id)["status"]
+        if status == "available":
+            break
+        time.sleep(20)
+    else:
+        raise Stop(f"{db_id} 30 分鐘內沒有變成 available（最後 {status}）；不要重跑，稍後用 db-status 讀回。")
+    readback = db_readback(db_id)
+    db["rds"]["minutes_to_available"] = round((time.monotonic() - t0) / 60, 1)
+    db["rds"]["readback"] = readback
+    save_json(RESOURCES, res)
+    env = DB_ENV.read_text().replace("DB_HOST=\n", f"DB_HOST={readback['endpoint']}\n", 1)
+    lab.atomic_write(DB_ENV, env)
+    print_db_readback(res)
+
+
+def print_db_readback(res):
+    db = res["db"]
+    rb = db_readback(db["rds"]["id"])
+    tables = aws("ec2", "describe-route-tables", "--route-table-ids", db["route_table"]["id"])["RouteTables"][0]
+    sg = aws("ec2", "describe-security-groups", "--group-ids", db["security_group"]["id"])["SecurityGroups"][0]
+    print(f"讀回（{utc()}）：")
+    print(f"  RDS ...{db['rds']['id'][-4:]}  status={rb['status']}  PubliclyAccessible={rb['PubliclyAccessible']}")
+    print(f"  {rb['engine']}  {rb['class']}  {rb['storage']}  encrypted={rb['encrypted']}  multi_az={rb['multi_az']}  az={rb['az']}  db={rb['db_name']}")
+    for i in (1, 2):
+        s = db[f"subnet_{i}"]
+        print(f"  subnet ...{s['id'][-4:]}  {s['cidr']}  {s['az']}")
+    routes = [f"{r.get('DestinationCidrBlock')}→{r.get('GatewayId') or r.get('NatGatewayId') or '?'}" for r in tables["Routes"]]
+    assoc = sorted("..." + a["SubnetId"][-4:] for a in tables["Associations"] if a.get("SubnetId"))
+    print(f"  route table ...{tables['RouteTableId'][-4:]}  routes={routes}  associated={assoc}")
+    for p in sg["IpPermissions"]:
+        print(f"  SG-db ...{sg['GroupId'][-4:]}  in tcp/{p.get('FromPort')}  from SG {['...' + g['GroupId'][-4:] for g in p.get('UserIdGroupPairs', [])]}"
+              f"  cidrs={[r['CidrIp'] for r in p.get('IpRanges', [])]}")
+    if "minutes_to_available" in db["rds"]:
+        print(f"  從 create-db-instance 到 available：{db['rds']['minutes_to_available']} 分鐘")
+
+
+def cmd_db_status(args):
+    res = current()
+    lab.verify()
+    if not res.get("db", {}).get("rds"):
+        raise Stop("resources.json 沒有 RDS 紀錄。")
+    print_db_readback(res)
+
+
 def cmd_deploy(args):
     sha = resolve_commit("HEAD")
     dirty = subprocess.run(["git", "status", "--porcelain", "--", "app/service.py", "deploy/nginx.conf"],
@@ -448,6 +615,15 @@ def cmd_deploy(args):
     names = {line.split("=", 1)[0] for line in APP_ENV.read_text().splitlines() if "=" in line and line.split("=", 1)[1]}
     if not {"REPORTER_TOKEN", "OPERATOR_TOKEN"} <= names:
         raise Stop(".local/app.env 缺少 REPORTER_TOKEN 或 OPERATOR_TOKEN（不顯示內容）。")
+    secret_files = [APP_ENV]
+    if DB_ENV.exists():  # W5: the DB settings go into the same root-only secret file
+        if (DB_ENV.stat().st_mode & 0o777) != 0o600:
+            raise Stop(".local/db.env 權限不是 600；停止部署。")
+        db_names = {line.split("=", 1)[0] for line in DB_ENV.read_text().splitlines()
+                    if "=" in line and line.split("=", 1)[1]}
+        if not {"DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"} <= db_names:
+            raise Stop(".local/db.env 缺少 DB_HOST／DB_NAME／DB_USER／DB_PASSWORD（RDS 還沒 available？不顯示內容）。")
+        secret_files.append(DB_ENV)
     res = current()
     cfg = load_config(argparse.Namespace(group=res["group"], owner=res["owner"], source_cidr=res["source_cidr"],
                                          week=None, az=None))
@@ -459,17 +635,19 @@ def cmd_deploy(args):
     sha, user_data, size = build_user_data(sha)
     confirm(["== deploy.sh：更新同一台主機 ==", f"目標主機：{res['instance']['id']} ec2-user@{ip}",
              f"commit：{sha}（{subprocess.check_output(['git', 'log', '-1', '--format=%s', sha], cwd=ROOT, text=True).strip()}）",
-             f"步驟：SSH 執行安裝腳本（{size} bytes）→ app.env 經 stdin 放到 /etc/inspection/app.env（root 600）→ 重啟 inspection → 驗 /health"])
+             f"步驟：SSH 執行安裝腳本（{size} bytes）→ {' + '.join(p.name for p in secret_files)} 經 stdin 放到 "
+             "/etc/inspection/app.env（root 600）→ 重啟 inspection → 驗 /health"])
     base = ssh_base(cfg, ip)
     with user_data.open("rb") as script:
         run = subprocess.run(base + ["sudo bash -s"], stdin=script, capture_output=True, text=True, check=False)
     if run.returncode:
         raise Stop(f"安裝腳本失敗（exit {run.returncode}）：{run.stderr.strip().splitlines()[-1:]}")
     print("1/3 安裝腳本完成")
-    with APP_ENV.open("rb") as secret:
-        run = subprocess.run(base + ["sudo install -d -m 700 -o root -g root /etc/inspection && "
-                                     "sudo install -m 600 -o root -g root /dev/stdin /etc/inspection/app.env"],
-                             stdin=secret, capture_output=True, text=True, check=False)
+    payload = b"".join(p.read_bytes().rstrip(b"\n") + b"\n" for p in secret_files)
+    # /etc/inspection stays 755 (the service user reads rds-ca.pem there); app.env itself is root 600.
+    run = subprocess.run(base + ["sudo install -d -m 755 -o root -g root /etc/inspection && "
+                                 "sudo install -m 600 -o root -g root /dev/stdin /etc/inspection/app.env"],
+                         input=payload, capture_output=True, check=False)
     if run.returncode:
         raise Stop(f"放置秘密檔失敗（exit {run.returncode}）。")
     run = subprocess.run(base + ["sudo systemctl restart inspection && sudo stat -c '%U:%G %a %n' /etc/inspection/app.env"],
@@ -478,10 +656,13 @@ def cmd_deploy(args):
         raise Stop(f"重啟 inspection 失敗（exit {run.returncode}）。")
     print("2/3 秘密檔：" + run.stdout.strip())
     health, _ = wait_health(ip, sha, need_auth=True, limit=120)
+    if DB_ENV in secret_files and health.get("db_configured") is not True:
+        raise Stop("db.env 已放上主機，但 /health 的 db_configured 不是 true；看 sudo journalctl -u inspection -n 30。")
+    res = current()  # re-read: another helper (e.g. db-up) may have written resources.json meanwhile
     res["deployed"] = {"commit": sha, "at": utc(), "public_ip": ip, "health": health}
     save_json(RESOURCES, res)
     print("3/3 " + json.dumps(health, ensure_ascii=False))
-    print(f"完成：version = {sha[:7]}，auth_configured = true")
+    print(f"完成：version = {sha[:7]}，auth_configured = true，db_configured = {str(health.get('db_configured')).lower()}")
 
 
 def main():
@@ -497,6 +678,8 @@ def main():
     sub.add_parser("start")
     sub.add_parser("status")
     sub.add_parser("deploy")
+    sub.add_parser("db-up")
+    sub.add_parser("db-status")
     sources = sub.add_parser("sources")
     sources.add_argument("--add", nargs="+", required=True, metavar="IP/32")
     sources.add_argument("--reason", required=True)
@@ -504,7 +687,7 @@ def main():
     try:
         REGION = lab.context()["region"]
         {"up": cmd_up, "down": cmd_down, "start": cmd_start, "status": cmd_status, "deploy": cmd_deploy,
-         "sources": cmd_sources}[args.command](args)
+         "sources": cmd_sources, "db-up": cmd_db_up, "db-status": cmd_db_status}[args.command](args)
     except (Stop, lab.LabError) as exc:
         print("STOP: " + str(exc), file=sys.stderr)
         return 1

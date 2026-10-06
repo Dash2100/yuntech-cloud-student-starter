@@ -1,4 +1,4 @@
-"""Offline W4 event-API contract checks against a local server; no AWS calls."""
+"""Offline W4 event-API contract checks against a local server and a throwaway local PostgreSQL; no AWS calls."""
 import importlib.util
 import json
 from pathlib import Path
@@ -15,6 +15,7 @@ spec = importlib.util.spec_from_file_location("w04_service", ROOT / "app/service
 service = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(service)
 sys.path.insert(0, str(ROOT / "tests"))
+import local_pg  # noqa: E402
 import reject_matrix  # noqa: E402
 
 REPORTER = "reporter-synthetic-token-for-offline-tests"
@@ -28,12 +29,14 @@ def fixtures():
     return {path.name: json.loads(path.read_text(encoding="utf-8")) for path in sorted(FIXTURES.glob("*.json"))}
 
 
+@unittest.skipUnless(local_pg.available(), "needs psycopg2 and PostgreSQL server binaries")
 class EventApi(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         version = Path(self.tmp.name) / "version"
         version.write_text(VERSION)
-        self.server = service.make_server(version, port=0, tokens={"reporter": REPORTER, "operator": OPERATOR})
+        self.server = service.make_server(version, port=0, tokens={"reporter": REPORTER, "operator": OPERATOR},
+                                          store=local_pg.fresh_store(service))
         self.worker = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.worker.start()
         self.base = "http://127.0.0.1:" + str(self.server.server_port)
@@ -97,7 +100,7 @@ class EventApi(unittest.TestCase):
         self.assertIn("version: " + VERSION, lines[1])
         self.assertTrue(all(REPORTER not in line and OPERATOR not in line for line in lines))
 
-    # ---- order of checks: 401 -> 403 -> 400 -> 409 -> 201 ---------------
+    # ---- order of checks: 401 -> 403 -> 400 -> 409 / 200 / 201 ----------
     def test_identity_is_checked_before_content(self):
         bad = dict(GOOD, observed_at="yesterday", extra=1)
         self.rejected(401, "authorization", "POST", "/events", None, bad)
@@ -141,6 +144,7 @@ class EventApi(unittest.TestCase):
         self.assertEqual(status, 201)
 
     def test_duplicate_is_409_and_first_copy_kept(self):
+        # W5 idempotency: an identical resend is 200 (see test_w05_persistence); a different body is 409.
         self.assertEqual(self.call("POST", "/events", REPORTER, dict(GOOD, note="first"))[0], 201)
         self.rejected(409, "event_id", "POST", "/events", REPORTER, dict(GOOD, note="second"))
         status, event = self.call("GET", "/events/" + GOOD["event_id"], OPERATOR)

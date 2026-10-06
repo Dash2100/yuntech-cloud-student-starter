@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Inspection service: W3 /health plus the W4 event API and display page.
+"""Inspection service: W3 /health, the W4 event API and display page, W5 persistence.
 
-Events live only in process memory (W5 adds a database). Tokens come from the
-environment (systemd EnvironmentFile=/etc/inspection/app.env) and are never
-logged, echoed in responses or placed in the page.
-Must stay compatible with the AL2023 system Python (3.9).
+W5: events live in a private RDS PostgreSQL (table `events`, primary key event_id),
+so a restart keeps them and a resend of the same event is idempotent:
+new event_id -> 201, same id + same content -> 200 (nothing added), same id +
+different content -> 409. The primary key decides duplicates (INSERT ... ON CONFLICT),
+never a "look first, then write" check. Every SQL statement is parameterised.
+
+Tokens and DB settings come from the environment (systemd
+EnvironmentFile=/etc/inspection/app.env) and are never logged, echoed in
+responses or placed in the page. Without DB settings the service still starts:
+/health answers 200 with db_configured=false and the event API answers 503.
+Must stay compatible with the AL2023 system Python (3.9) and python3-psycopg2.
 """
 from datetime import datetime, timezone
 import hmac
@@ -27,6 +34,19 @@ TYPES = ("status", "anomaly", "test")
 REQUIRED = ("event_id", "device_id", "observed_at", "type")
 ALLOWED = REQUIRED + ("note",)
 NOTE_MAX = 200
+CONTENT = ("device_id", "observed_at", "type", "note")  # compared on a resend
+DB_CA = "/etc/inspection/rds-ca.pem"
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    event_id    text PRIMARY KEY,
+    device_id   text NOT NULL,
+    observed_at text NOT NULL,  -- kept exactly as sent so a resend compares as identical
+    type        text NOT NULL,
+    note        text,
+    received_at timestamptz NOT NULL
+)
+"""
+COLUMNS = "event_id, device_id, observed_at, type, note, received_at"
 
 
 def utc_now():
@@ -92,28 +112,116 @@ def validate_event(raw):
     return event
 
 
-class EventStore:
-    """In-memory only: restarting the service loses every event (W4 scope)."""
+def log(text):
+    print(text, file=sys.stderr, flush=True)
 
-    def __init__(self):
+
+def db_problem(exc):
+    """Name the kind of DB failure without the message (it can contain host or user names)."""
+    text = str(exc).lower()
+    for words, kind in ((("timeout", "could not connect", "connection refused", "could not translate"), "network"),
+                        (("password", "authentication"), "auth"),
+                        (("certificate", "ssl", "tls"), "tls"),
+                        (("syntax", "column", "relation", "permission denied"), "sql")):
+        if any(w in text for w in words):
+            return kind
+    return type(exc).__name__
+
+
+class DbStore:
+    """Events in PostgreSQL. One short connection per request; the schema is created on first use."""
+
+    def __init__(self, connect_kwargs):
+        import psycopg2  # imported here so the service can start (db_configured=false) without the driver
+        self._db = psycopg2
+        self._kwargs = dict(connect_kwargs)
+        self._ready = False
         self._lock = threading.Lock()
-        self._events = {}
+
+    @classmethod
+    def from_env(cls, environ=None):
+        env = os.environ if environ is None else environ
+        names = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD")
+        if not all(env.get(n) for n in names):
+            return None
+        try:
+            return cls({"host": env["DB_HOST"], "port": int(env.get("DB_PORT") or 5432), "dbname": env["DB_NAME"],
+                        "user": env["DB_USER"], "password": env["DB_PASSWORD"], "sslmode": "verify-full",
+                        "sslrootcert": DB_CA, "connect_timeout": 5, "application_name": "inspection"})
+        except ImportError:
+            log("db: psycopg2 is not installed")
+            return None
+
+    def _run(self, work):
+        try:
+            conn = self._db.connect(**self._kwargs)
+        except self._db.Error as exc:
+            log("db connect failed: " + db_problem(exc))
+            raise Rejected(503, "db_unavailable", "database")
+        try:
+            if not self._ready:
+                with self._lock:  # one CREATE at a time; concurrent IF NOT EXISTS can still collide
+                    if not self._ready:
+                        with conn, conn.cursor() as cur:
+                            cur.execute(SCHEMA)
+                        self._ready = True
+            with conn:  # commit on success, roll back on error
+                with conn.cursor() as cur:
+                    return work(cur)
+        except self._db.Error as exc:
+            log("db query failed: " + db_problem(exc))
+            raise Rejected(503, "db_unavailable", "database")
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _row(row):
+        event = dict(zip(COLUMNS.split(", "), row))
+        if event["note"] is None:
+            del event["note"]
+        event["received_at"] = event["received_at"].astimezone(timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        return event
+
+    def check(self):
+        """Startup probe: create the table if the DB is reachable; never raises."""
+        try:
+            self._run(lambda cur: None)
+            log("db: ready")
+        except Rejected:
+            pass
 
     def add(self, event):
-        with self._lock:
-            if event["event_id"] in self._events:
-                raise Rejected(409, "duplicate_event", "event_id")
-            stored = dict(event, received_at=utc_now())
-            self._events[event["event_id"]] = stored
-            return stored
+        """Returns (status, stored event): 201 new, 200 identical resend. Raises 409 on a conflicting resend."""
+        def work(cur):
+            cur.execute("INSERT INTO events (" + COLUMNS + ") VALUES (%s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (event_id) DO NOTHING RETURNING " + COLUMNS,
+                        (event["event_id"], event["device_id"], event["observed_at"], event["type"],
+                         event.get("note"), datetime.now(timezone.utc)))
+            row = cur.fetchone()
+            if row:
+                return 201, self._row(row)
+            # The primary key refused the insert: compare with the copy that is already stored.
+            cur.execute("SELECT " + COLUMNS + " FROM events WHERE event_id = %s", (event["event_id"],))
+            stored = self._row(cur.fetchone())
+            if all(stored.get(k) == event.get(k) for k in CONTENT):
+                return 200, stored
+            raise Rejected(409, "duplicate_event", "event_id")
+        return self._run(work)
 
     def latest(self, limit=LIST_LIMIT):
-        with self._lock:
-            return list(reversed(list(self._events.values())[-limit:]))
+        def work(cur):
+            cur.execute("SELECT " + COLUMNS + " FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                        (limit,))
+            return [self._row(r) for r in cur.fetchall()]
+        return self._run(work)
 
     def get(self, event_id):
-        with self._lock:
-            return self._events.get(event_id)
+        def work(cur):
+            cur.execute("SELECT " + COLUMNS + " FROM events WHERE event_id = %s", (event_id,))
+            row = cur.fetchone()
+            return self._row(row) if row else None
+        return self._run(work)
 
 
 PAGE = """<!doctype html>
@@ -204,7 +312,8 @@ PAGE = """<!doctype html>
   });
   fetch("/health", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (h) {
     el("health").textContent = "service=" + h.service + "　version=" + h.version +
-      "　started_at=" + h.started_at + "　auth_configured=" + h.auth_configured;
+      "　started_at=" + h.started_at + "　auth_configured=" + h.auth_configured +
+      "　db_configured=" + h.db_configured;
   }).catch(function () { el("health").textContent = "無法讀取 /health"; });
 }());
 </script>
@@ -213,8 +322,10 @@ PAGE = """<!doctype html>
 """
 
 
-def make_server(version_file, port=8080, tokens=None):
-    """tokens: {"reporter": str, "operator": str}; defaults to REPORTER_TOKEN/OPERATOR_TOKEN env."""
+def make_server(version_file, port=8080, tokens=None, store="env"):
+    """tokens: {"reporter": str, "operator": str}; defaults to REPORTER_TOKEN/OPERATOR_TOKEN env.
+    store: an object with add/latest/get (tests pass a DbStore on a local PostgreSQL), None for
+    "no database", or "env" to build it from DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD."""
     version = Path(version_file).read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9a-f]{40}", version):
         raise ValueError("version must contain the deployed 40-character Git commit SHA")
@@ -224,7 +335,16 @@ def make_server(version_file, port=8080, tokens=None):
                   "operator": os.environ.get("OPERATOR_TOKEN", "")}
     roles = [(role, (tokens.get(role) or "").encode("utf-8")) for role in ("reporter", "operator")]
     auth_configured = all(secret for _, secret in roles) and roles[0][1] != roles[1][1]
-    store = EventStore()
+    if store == "env":
+        store = DbStore.from_env()
+        if store is not None:
+            store.check()
+    db_configured = store is not None
+
+    def events():
+        if store is None:
+            raise Rejected(503, "db_not_configured", "database")
+        return store
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "inspection"
@@ -292,7 +412,8 @@ def make_server(version_file, port=8080, tokens=None):
                 path = self._route(method)
                 if path == "/health":
                     self._json(200, {"status": "ok", "service": "inspection", "version": version,
-                                     "started_at": started, "auth_configured": auth_configured})
+                                     "started_at": started, "auth_configured": auth_configured,
+                                     "db_configured": db_configured})
                 elif path == "/":
                     nonce = secrets.token_urlsafe(16)
                     csp = ("default-src 'none'; script-src 'nonce-{0}'; style-src 'nonce-{0}'; "
@@ -305,11 +426,11 @@ def make_server(version_file, port=8080, tokens=None):
                     self._create()
                 elif path == "/events":
                     self._require("operator")
-                    self._json(200, {"events": store.latest()})
+                    self._json(200, {"events": events().latest()})
                 else:
                     self._require("operator")
                     event_id = path[len("/events/"):]
-                    event = store.get(event_id) if ID_RE.fullmatch(event_id) else None
+                    event = events().get(event_id) if ID_RE.fullmatch(event_id) else None
                     if event is None:
                         raise Rejected(404, "not_found", "event_id")
                     self._json(200, event)
@@ -319,8 +440,8 @@ def make_server(version_file, port=8080, tokens=None):
                 self._error(exc, extra)
 
         def _create(self):
-            # Order matters: 401 -> 403 -> 400 -> 409 -> 201. Nothing about the body is
-            # inspected until the caller is known to be a reporter.
+            # Order matters: 401 -> 403 -> 400 -> 503 (no DB) -> 409 / 200 / 201. Nothing about
+            # the body is inspected until the caller is known to be a reporter.
             self._require("reporter")
             media = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if media != "application/json":
@@ -331,8 +452,9 @@ def make_server(version_file, port=8080, tokens=None):
             if int(length) > MAX_BODY:
                 raise Rejected(400, "body_too_large", "body")
             event = validate_event(self.rfile.read(int(length)))
-            stored = store.add(event)
-            self._json(201, {"event_id": stored["event_id"], "received_at": stored["received_at"]})
+            status, stored = events().add(event)
+            # 200 = the same event was already stored (resend); received_at is the first arrival.
+            self._json(status, {"event_id": stored["event_id"], "received_at": stored["received_at"]})
 
         def do_GET(self):
             self._dispatch("GET")
@@ -357,7 +479,7 @@ def make_server(version_file, port=8080, tokens=None):
 
         def handle_error(self, request, client_address):
             # The default prints a traceback that may include request data; keep only the type.
-            print("request failed: " + type(sys.exc_info()[1]).__name__, file=sys.stderr)
+            log("request failed: " + type(sys.exc_info()[1]).__name__)
 
     return Server(("127.0.0.1", port), Handler)
 
