@@ -10,3 +10,4 @@
 | W2：私有物件與短效分享 | [任務](labs/02-private-s3/README.md) |
 | W3：巡檢服務雛型上線 | [Sprint 任務](labs/03-service-prototype/README.md) |
 | W4：第一筆事件可送入、查詢並顯示 | [Sprint 任務](labs/04-web-api/README.md) |
+| W5：重啟不丟資料、重送不重複新增 | [Sprint 任務](labs/05-private-rds/README.md) |
