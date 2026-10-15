@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspection service: W3 /health, the W4 event API and display page, W5 persistence.
+"""Inspection service: W3 /health, the W4 event API and display page, W5 persistence, W6 device filter.
 
 W5: events live in a private RDS PostgreSQL (table `events`, primary key event_id),
 so a restart keeps them and a resend of the same event is idempotent:
@@ -11,6 +11,9 @@ Tokens and DB settings come from the environment (systemd
 EnvironmentFile=/etc/inspection/app.env) and are never logged, echoed in
 responses or placed in the page. Without DB settings the service still starts:
 /health answers 200 with db_configured=false and the event API answers 503.
+
+W6: GET /events?device_id=<id> (operator) returns that device's latest 50 events,
+newest received_at first; the display page has a device-id box that adds the filter.
 Must stay compatible with the AL2023 system Python (3.9) and python3-psycopg2.
 """
 from datetime import datetime, timezone
@@ -23,7 +26,7 @@ import re
 import secrets
 import sys
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 MAX_BODY = 4 * 1024
 LIST_LIMIT = 50
@@ -44,7 +47,8 @@ CREATE TABLE IF NOT EXISTS events (
     type        text NOT NULL,
     note        text,
     received_at timestamptz NOT NULL
-)
+);
+CREATE INDEX IF NOT EXISTS events_device_received ON events (device_id, received_at DESC)
 """
 COLUMNS = "event_id, device_id, observed_at, type, note, received_at"
 
@@ -209,10 +213,14 @@ class DbStore:
             raise Rejected(409, "duplicate_event", "event_id")
         return self._run(work)
 
-    def latest(self, limit=LIST_LIMIT):
+    def latest(self, limit=LIST_LIMIT, device_id=None):
         def work(cur):
-            cur.execute("SELECT " + COLUMNS + " FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
-                        (limit,))
+            if device_id is None:
+                cur.execute("SELECT " + COLUMNS + " FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
+                            (limit,))
+            else:
+                cur.execute("SELECT " + COLUMNS + " FROM events WHERE device_id = %s "
+                            "ORDER BY received_at DESC, event_id DESC LIMIT %s", (device_id, limit))
             return [self._row(r) for r in cur.fetchall()]
         return self._run(work)
 
@@ -239,6 +247,7 @@ PAGE = """<!doctype html>
   .meta { color: var(--muted); font-size: 13px; margin-bottom: 16px; word-break: break-all; }
   .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   input { flex: 1 1 280px; padding: 6px 8px; font: inherit; }
+  #device { flex: 0 1 220px; }
   button { padding: 6px 14px; font: inherit; cursor: pointer; }
   #status { min-height: 1.5em; margin: 8px 0; }
   .table-wrap { overflow-x: auto; }
@@ -254,6 +263,8 @@ PAGE = """<!doctype html>
 <div class="bar">
   <input id="token" type="password" autocomplete="off" spellcheck="false"
          placeholder="貼上 operator 權杖（只存在這個頁面的變數，不寫進網址或瀏覽器）">
+  <input id="device" type="text" maxlength="32" autocomplete="off" spellcheck="false"
+         placeholder="設備編號（選填，例如 g03-m2-d01）">
   <button id="load" type="button">讀取事件</button>
   <button id="forget" type="button">清除權杖</button>
 </div>
@@ -289,8 +300,10 @@ PAGE = """<!doctype html>
     if (typed) { token = typed; }
     el("token").value = "";  // never leave the token visible on screen
     if (!token) { say("請先貼上 operator 權杖。"); return; }
+    var device = el("device").value.trim();
+    var url = "/events" + (device ? "?device_id=" + encodeURIComponent(device) : "");
     say("讀取中…");
-    fetch("/events", { headers: { "Authorization": "Bearer " + token }, cache: "no-store" })
+    fetch(url, { headers: { "Authorization": "Bearer " + token }, cache: "no-store" })
       .then(function (r) {
         return r.json().then(function (data) { return { status: r.status, data: data }; });
       })
@@ -301,12 +314,14 @@ PAGE = """<!doctype html>
           return;
         }
         render(res.data.events);
-        say("共 " + res.data.events.length + " 筆（最新在上，最多 50 筆）；讀取時間 " + new Date().toISOString());
+        say((device ? "設備 " + device + "：" : "") + "共 " + res.data.events.length +
+            " 筆（最新在上，最多 50 筆）；讀取時間 " + new Date().toISOString());
       })
       .catch(function () { say("連線失敗。"); });
   }
   el("load").addEventListener("click", load);
   el("token").addEventListener("keydown", function (e) { if (e.key === "Enter") { load(); } });
+  el("device").addEventListener("keydown", function (e) { if (e.key === "Enter") { load(); } });
   el("forget").addEventListener("click", function () {
     token = ""; el("token").value = ""; render([]); say("已清除權杖。");
   });
@@ -405,6 +420,15 @@ def make_server(version_file, port=8080, tokens=None, store="env"):
                 raise Rejected(405, "method_not_allowed", "method")
             return path
 
+        def _device_filter(self):
+            """W6: optional ?device_id=; checked after the role, before the database."""
+            values = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("device_id")
+            if values is None:
+                return None
+            if len(values) != 1 or not DEVICE_RE.fullmatch(values[0]):
+                raise Rejected(400, "invalid_query", "device_id")
+            return values[0]
+
         # ---- handlers --------------------------------------------------
         def _dispatch(self, method):
             extra = None
@@ -426,7 +450,8 @@ def make_server(version_file, port=8080, tokens=None, store="env"):
                     self._create()
                 elif path == "/events":
                     self._require("operator")
-                    self._json(200, {"events": events().latest()})
+                    device_id = self._device_filter()
+                    self._json(200, {"events": events().latest(device_id=device_id)})
                 else:
                     self._require("operator")
                     event_id = path[len("/events/"):]

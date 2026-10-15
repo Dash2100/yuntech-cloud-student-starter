@@ -9,6 +9,7 @@
   sources  add exact /32 SG sources after the egress address changed (prints old/new first)
   db-up    W5: 2 private subnets + local-only route table + DB subnet group + SG-db + private RDS
   db-status  read back the RDS and its network (read-only)
+  iot-up   W6: IoT endpoint + 2 certificates (gateway, consumer) + 2 exact-resource policies
 
 AWS calls go through scripts/lab.py run_aws (learnerlab profile, cleaned env).
 Every change prints its exact scope and waits for a typed "yes".
@@ -40,6 +41,10 @@ CONFIG = LOCAL / "config.json"
 KNOWN_HOSTS = LOCAL / "known_hosts"
 APP_ENV = LOCAL / "app.env"
 DB_ENV = LOCAL / "db.env"
+IOT_DIR = LOCAL / "iot"
+IOT_ROLES = ("gw", "consumer")
+ROOT_CA_URL = "https://www.amazontrust.com/repository/AmazonRootCA1.pem"
+REMOTE_IOT = "/etc/inspection/iot"
 INSTANCE_TYPE = "t3.micro"
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 LABEL_RE = re.compile(r"[a-z0-9]{1,16}")
@@ -604,12 +609,115 @@ def cmd_db_status(args):
     print_db_readback(res)
 
 
+def iot_code(res):
+    """The W6 代號 <group>-<owner>, e.g. g03-m2; every IoT name is derived from it."""
+    return f"{res['group']}-{res['owner']}"
+
+
+def iot_topic(code):
+    return f"cxe/{code}/gw/events"
+
+
+def iot_policies(region, account, code):
+    """Spec A #3: exact resources only. Subscribe is checked against topicfilter/, Receive against topic/."""
+    arn = f"arn:aws:iot:{region}:{account}:"
+    topic = iot_topic(code)
+
+    def doc(*statements):
+        return {"Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": action, "Resource": arn + resource}
+                              for action, resource in statements]}
+    return {"gw": doc(("iot:Connect", f"client/gw-{code}"), ("iot:Publish", f"topic/{topic}")),
+            "consumer": doc(("iot:Connect", f"client/consumer-{code}"), ("iot:Subscribe", f"topicfilter/{topic}"),
+                            ("iot:Receive", f"topic/{topic}"))}
+
+
+def iot_env(code, endpoint):
+    """The IOT_ lines of /etc/inspection/app.env read by app/consumer.py (spec C/E)."""
+    devices = ",".join(f"{code}-d{n:02d}" for n in range(1, 11))
+    return (f"IOT_ENDPOINT={endpoint}\nIOT_TOPIC={iot_topic(code)}\nIOT_CLIENT_ID=consumer-{code}\n"
+            f"IOT_DEVICE_IDS={devices}\nIOT_CA={REMOTE_IOT}/AmazonRootCA1.pem\n"
+            f"IOT_CERT={REMOTE_IOT}/consumer.cert.pem\nIOT_KEY={REMOTE_IOT}/consumer.private.key\n")
+
+
+def cmd_iot_up(args):
+    """W6 T2 (spec A). Re-runnable: whatever resources.json already records is skipped, never recreated."""
+    res = current(require_instance=False)
+    cfg = load_config(argparse.Namespace(group=res["group"], owner=res["owner"], source_cidr=res["source_cidr"],
+                                         week=None, az=None))
+    ctx = lab.verify()
+    code = iot_code(res)
+    policies = iot_policies(REGION, ctx["account"], code)
+    todo = [f"{role}：憑證" for role in IOT_ROLES if f"iot_{role}_cert_id" not in res]
+    todo += [f"cxe-{code}-{role}：政策" for role in IOT_ROLES if f"iot_{role}_policy" not in res]
+    for role in IOT_ROLES:
+        if f"iot_{role}_cert_id" not in res and (IOT_DIR / f"{role}.private.key").exists():
+            raise Stop(f".local/iot/{role}.private.key 已存在但 resources.json 沒有憑證 ID；不覆蓋私鑰，先查清楚。")
+    confirm([
+        "== iot-up.sh 將建立（W6 T2，IoT 身分） ==",
+        f"帳號末四碼 {ctx['account'][-4:]}，region {REGION}，代號 {code}，主題 {iot_topic(code)}",
+        "1. 讀 iot:Data-ATS 端點 → .local/iot/endpoint",
+        "2. 憑證 ×2（gw、consumer，ACTIVE）：憑證與私鑰由 AWS CLI 直接寫進 .local/iot/（目錄 700、檔案 600），不顯示",
+        f"3. 政策 cxe-{code}-gw：Connect client/gw-{code}、Publish topic/{iot_topic(code)}",
+        f"   政策 cxe-{code}-consumer：Connect client/consumer-{code}、Subscribe topicfilter/…、Receive topic/…（不用 *）",
+        "4. 政策附到對應憑證；下載 Amazon Root CA 1 → .local/iot/AmazonRootCA1.pem",
+        "這次要建：" + ("、".join(todo) if todo else "沒有（都已在 resources.json，只補附加與讀回）"),
+        "費用：IoT 憑證與政策閒置不計費；訊息依當期官方計價。回收：detach-policy → 憑證 INACTIVE → delete（以 ID）",
+    ])
+    IOT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    IOT_DIR.chmod(0o700)
+    endpoint = aws("iot", "describe-endpoint", "--endpoint-type", "iot:Data-ATS")["endpointAddress"]
+    lab.atomic_write(IOT_DIR / "endpoint", endpoint + "\n")
+    old_umask = os.umask(0o077)  # the CLI creates the key files: 600 from the first byte
+    try:
+        for role in IOT_ROLES:
+            if f"iot_{role}_cert_id" in res:
+                continue
+            # The JSON output also carries the private key: keep only the ID and ARN, never print it.
+            out = aws("iot", "create-keys-and-certificate", "--set-as-active",
+                      "--certificate-pem-outfile", str(IOT_DIR / f"{role}.cert.pem"),
+                      "--private-key-outfile", str(IOT_DIR / f"{role}.private.key"))
+            res[f"iot_{role}_cert_id"], res[f"iot_{role}_cert_arn"] = out["certificateId"], out["certificateArn"]
+            del out
+            for name in (f"{role}.cert.pem", f"{role}.private.key"):
+                (IOT_DIR / name).chmod(0o600)
+            save_json(RESOURCES, res)
+            print(f"憑證 {role}：{res[f'iot_{role}_cert_id'][:12]}…（私鑰已寫入 .local/iot/{role}.private.key）")
+    finally:
+        os.umask(old_umask)
+    for role in IOT_ROLES:
+        name = f"cxe-{code}-{role}"
+        if f"iot_{role}_policy" not in res:
+            aws("iot", "create-policy", "--policy-name", name, "--policy-document", json.dumps(policies[role]),
+                "--tags", json.dumps(tags(dict(cfg, week="w06"), name)))
+            res[f"iot_{role}_policy"] = name
+            save_json(RESOURCES, res)
+            print(f"政策 {name} 已建立")
+        aws("iot", "attach-policy", "--policy-name", res[f"iot_{role}_policy"],
+            "--target", res[f"iot_{role}_cert_arn"])  # idempotent
+    ca = IOT_DIR / "AmazonRootCA1.pem"
+    if not ca.exists():
+        with urllib.request.urlopen(ROOT_CA_URL, timeout=10) as response:
+            pem = response.read().decode("ascii")
+        if not pem.startswith("-----BEGIN CERTIFICATE-----"):
+            raise Stop("下載的 Root CA 不是 PEM 憑證；停止。")
+        lab.atomic_write(ca, pem)
+    print(f"讀回（{utc()}）：endpoint 已存 .local/iot/endpoint")
+    for role in IOT_ROLES:
+        status = aws("iot", "describe-certificate", "--certificate-id",
+                     res[f"iot_{role}_cert_id"])["certificateDescription"]["status"]
+        attached = [p["policyName"] for p in aws("iot", "list-attached-policies", "--target",
+                                                  res[f"iot_{role}_cert_arn"])["policies"]]
+        print(f"  {role:9} 憑證 {res[f'iot_{role}_cert_id'][:12]}…  {status}  附加政策 {attached}")
+    print("  .local/iot：" + "  ".join(f"{p.name} {oct(p.stat().st_mode & 0o777)[2:]}" for p in sorted(IOT_DIR.iterdir())))
+
+
 def cmd_deploy(args):
     sha = resolve_commit("HEAD")
-    dirty = subprocess.run(["git", "status", "--porcelain", "--", "app/service.py", "deploy/nginx.conf"],
-                           cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    dirty = subprocess.run(["git", "status", "--porcelain", "--", "app/service.py", "app/consumer.py",
+                            "deploy/nginx.conf"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
     if dirty:
-        raise Stop("app/service.py 或 deploy/nginx.conf 有未 commit 的修改；只部署已 commit 的版本，先 commit。")
+        raise Stop("app/service.py、app/consumer.py 或 deploy/nginx.conf 有未 commit 的修改；只部署已 commit 的版本，先 commit。")
     if not APP_ENV.exists() or (APP_ENV.stat().st_mode & 0o777) != 0o600:
         raise Stop(".local/app.env 不存在或權限不是 600；停止部署。")
     names = {line.split("=", 1)[0] for line in APP_ENV.read_text().splitlines() if "=" in line and line.split("=", 1)[1]}
@@ -625,6 +733,14 @@ def cmd_deploy(args):
             raise Stop(".local/db.env 缺少 DB_HOST／DB_NAME／DB_USER／DB_PASSWORD（RDS 還沒 available？不顯示內容）。")
         secret_files.append(DB_ENV)
     res = current()
+    iot_files = [IOT_DIR / n for n in ("AmazonRootCA1.pem", "consumer.cert.pem", "consumer.private.key")]
+    use_iot = (IOT_DIR / "consumer.private.key").exists()  # W6: iot-up.sh has run
+    if use_iot:
+        if not all(p.exists() for p in iot_files + [IOT_DIR / "endpoint"]):
+            raise Stop(".local/iot/ 缺少 endpoint、Root CA 或 consumer 憑證；先跑 deploy/iot-up.sh。")
+        if subprocess.run(["git", "cat-file", "-e", sha + ":app/consumer.py"], cwd=ROOT,
+                          stderr=subprocess.DEVNULL).returncode:
+            raise Stop("已有 IoT 憑證，但 HEAD 沒有 app/consumer.py；先 commit consumer 再部署。")
     cfg = load_config(argparse.Namespace(group=res["group"], owner=res["owner"], source_cidr=res["source_cidr"],
                                          week=None, az=None))
     lab.verify()
@@ -635,8 +751,10 @@ def cmd_deploy(args):
     sha, user_data, size = build_user_data(sha)
     confirm(["== deploy.sh：更新同一台主機 ==", f"目標主機：{res['instance']['id']} ec2-user@{ip}",
              f"commit：{sha}（{subprocess.check_output(['git', 'log', '-1', '--format=%s', sha], cwd=ROOT, text=True).strip()}）",
-             f"步驟：SSH 執行安裝腳本（{size} bytes）→ {' + '.join(p.name for p in secret_files)} 經 stdin 放到 "
-             "/etc/inspection/app.env（root 600）→ 重啟 inspection → 驗 /health"])
+             f"步驟：SSH 執行安裝腳本（{size} bytes）→ {' + '.join(p.name for p in secret_files)}"
+             + (" + IOT_ 設定" if use_iot else "") + " 經 stdin 放到 /etc/inspection/app.env（root 600）"
+             + (f" → consumer 憑證／私鑰／Root CA 放到 {REMOTE_IOT}/（700／600 inspection）" if use_iot else "")
+             + " → 重啟 inspection → 驗 /health" + (" → 重啟 inspection-consumer" if use_iot else "")])
     base = ssh_base(cfg, ip)
     with user_data.open("rb") as script:
         run = subprocess.run(base + ["sudo bash -s"], stdin=script, capture_output=True, text=True, check=False)
@@ -644,12 +762,25 @@ def cmd_deploy(args):
         raise Stop(f"安裝腳本失敗（exit {run.returncode}）：{run.stderr.strip().splitlines()[-1:]}")
     print("1/3 安裝腳本完成")
     payload = b"".join(p.read_bytes().rstrip(b"\n") + b"\n" for p in secret_files)
+    if use_iot:
+        payload += iot_env(iot_code(res), (IOT_DIR / "endpoint").read_text().strip()).encode()
     # /etc/inspection stays 755 (the service user reads rds-ca.pem there); app.env itself is root 600.
     run = subprocess.run(base + ["sudo install -d -m 755 -o root -g root /etc/inspection && "
                                  "sudo install -m 600 -o root -g root /dev/stdin /etc/inspection/app.env"],
                          input=payload, capture_output=True, check=False)
     if run.returncode:
         raise Stop(f"放置秘密檔失敗（exit {run.returncode}）。")
+    if use_iot:
+        # The consumer runs as `inspection`: the directory and files must be its own, or it cannot read them.
+        steps = [(f"sudo install -d -o inspection -g inspection -m 700 {REMOTE_IOT}", b"")]
+        steps += [(f"sudo sh -c 'umask 077 && cat > {REMOTE_IOT}/{p.name} && "
+                   f"chown inspection:inspection {REMOTE_IOT}/{p.name} && chmod 600 {REMOTE_IOT}/{p.name}'",
+                   p.read_bytes()) for p in iot_files]
+        for command, data in steps:
+            run = subprocess.run(base + [command], input=data, capture_output=True, check=False)
+            if run.returncode:
+                raise Stop(f"放置 {REMOTE_IOT} 失敗（exit {run.returncode}）。")
+        print(f"1b/3 {REMOTE_IOT}：Root CA、consumer 憑證與私鑰已放好（inspection 600）")
     run = subprocess.run(base + ["sudo systemctl restart inspection && sudo stat -c '%U:%G %a %n' /etc/inspection/app.env"],
                          capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
     if run.returncode:
@@ -662,6 +793,11 @@ def cmd_deploy(args):
     res["deployed"] = {"commit": sha, "at": utc(), "public_ip": ip, "health": health}
     save_json(RESOURCES, res)
     print("3/3 " + json.dumps(health, ensure_ascii=False))
+    if use_iot:
+        run = subprocess.run(base + ["sudo systemctl restart inspection-consumer; sleep 3; "
+                                     "systemctl is-active inspection inspection-consumer"],
+                             capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL)
+        print("systemctl is-active inspection inspection-consumer：" + " ".join(run.stdout.split()))
     print(f"完成：version = {sha[:7]}，auth_configured = true，db_configured = {str(health.get('db_configured')).lower()}")
 
 
@@ -680,6 +816,7 @@ def main():
     sub.add_parser("deploy")
     sub.add_parser("db-up")
     sub.add_parser("db-status")
+    sub.add_parser("iot-up")
     sources = sub.add_parser("sources")
     sources.add_argument("--add", nargs="+", required=True, metavar="IP/32")
     sources.add_argument("--reason", required=True)
@@ -687,7 +824,8 @@ def main():
     try:
         REGION = lab.context()["region"]
         {"up": cmd_up, "down": cmd_down, "start": cmd_start, "status": cmd_status, "deploy": cmd_deploy,
-         "sources": cmd_sources, "db-up": cmd_db_up, "db-status": cmd_db_status}[args.command](args)
+         "sources": cmd_sources, "db-up": cmd_db_up, "db-status": cmd_db_status,
+         "iot-up": cmd_iot_up}[args.command](args)
     except (Stop, lab.LabError) as exc:
         print("STOP: " + str(exc), file=sys.stderr)
         return 1
