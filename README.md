@@ -11,3 +11,4 @@
 | W3：巡檢服務雛型上線 | [Sprint 任務](labs/03-service-prototype/README.md) |
 | W4：第一筆事件可送入、查詢並顯示 | [Sprint 任務](labs/04-web-api/README.md) |
 | W5：重啟不丟資料、重送不重複新增 | [Sprint 任務](labs/05-private-rds/README.md) |
+| W6：多個模擬設備回報與設備篩選 | [Sprint 任務](labs/06-iot/README.md) |

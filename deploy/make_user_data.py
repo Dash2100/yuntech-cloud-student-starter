@@ -17,6 +17,10 @@ def build(commit):
     files = {}
     for name in ("app/service.py", "deploy/nginx.conf"):
         files[name] = subprocess.check_output(["git", "show", sha + ":" + name], cwd=ROOT)
+    # W6：consumer.py 寫好、commit 之後才打包；還沒有就跳過，不影響服務本身
+    if subprocess.run(["git", "cat-file", "-e", sha + ":app/consumer.py"], cwd=ROOT,
+                      stderr=subprocess.DEVNULL).returncode == 0:
+        files["app/consumer.py"] = subprocess.check_output(["git", "show", sha + ":app/consumer.py"], cwd=ROOT)
     files["app/version"] = (sha + "\n").encode()
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w") as tf:
@@ -29,7 +33,9 @@ def build(commit):
     payload = base64.b64encode(gzip.compress(archive.getvalue(), mtime=0)).decode()
     script = """#!/bin/bash
 set -euo pipefail
-dnf install -y nginx python3 python3-psycopg2 postgresql15
+dnf install -y nginx python3 python3-pip python3-psycopg2 postgresql15
+install -d -m 755 /opt/inspection/vendor
+python3 -m pip install --disable-pip-version-check --target /opt/inspection/vendor paho-mqtt==2.1.0
 install -d -m 755 /etc/inspection
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /etc/inspection/rds-ca.pem
 chmod 644 /etc/inspection/rds-ca.pem
@@ -59,11 +65,37 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 W3_UNIT
+cat > /etc/systemd/system/inspection-consumer.service <<'W6_UNIT'
+[Unit]
+Description=W6 inspection MQTT consumer
+After=network-online.target inspection.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=inspection
+Environment=HOME=/opt/inspection
+Environment=PYTHONPATH=/opt/inspection/vendor
+EnvironmentFile=-/etc/inspection/app.env
+WorkingDirectory=/opt/inspection/app
+ExecStart=/usr/bin/python3 /opt/inspection/app/consumer.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+[Install]
+WantedBy=multi-user.target
+W6_UNIT
 systemctl daemon-reload
 nginx -t
 systemctl enable --now inspection nginx
 systemctl restart inspection
 systemctl reload nginx
+if [ -f /opt/inspection/app/consumer.py ]; then
+  systemctl enable inspection-consumer
+  if [ -d /etc/inspection/iot ]; then systemctl restart inspection-consumer; fi
+fi
 """.replace("PAYLOAD", payload)
     data = script.encode()
     if len(data) >= 16 * 1024:
